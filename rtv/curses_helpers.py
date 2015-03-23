@@ -5,7 +5,7 @@ import curses
 from curses import textpad, ascii
 from contextlib import contextmanager
 
-from .docs import HELP
+from . import HELP
 from .helpers import strip_textpad
 
 __all__ = ['ESCAPE', 'UARROW', 'DARROW', 'BULLET', 'show_notification',

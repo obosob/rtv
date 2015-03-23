@@ -1,11 +1,13 @@
 import curses
+import sys
 
 import praw.errors
+import six
 
 from .helpers import clean
-from .curses_helpers import Color, show_notification
+from .curses_helpers import Color, show_notification, show_help
 
-__all__ = ['Navigator']
+__all__ = ['Navigator', 'Controller', 'BasePage']
 
 class Navigator(object):
     """
@@ -96,6 +98,55 @@ class Navigator(object):
             return True
 
 
+class Controller(object):
+    """
+    Simple event handler for triggering functions with curses keypresses.
+
+    Register a keystroke to a class method using the @register decorator.
+    #>>> @Controller.register('a', 'A')
+    #>>> def func(self, *args)
+
+    Register a default behavior by using `None`.
+    #>>> @Controller.register(None)
+    #>>> def default_func(self, *args)
+
+    Bind the controller to a class instance and trigger a key. Additional
+    arguments will be passed to the function.
+    #>>> controller = Controller(self)
+    #>>> controller.trigger('a', *args)
+    """
+
+    character_map = {None: (lambda *args, **kwargs: None)}
+
+    def __init__(self, instance):
+        self.instance = instance
+
+    def trigger(self, char, *args, **kwargs):
+
+        if isinstance(char, six.string_types) and len(char) == 1:
+            char = ord(char)
+
+        func = self.character_map.get(char)
+        if func is None:
+            func = Controller.character_map.get(char)
+        if func is None:
+            func = self.character_map.get(None)
+        if func is None:
+            func = Controller.character_map.get(None)
+        return func(self.instance, *args, **kwargs)
+
+    @classmethod
+    def register(cls, *chars):
+        def wrap(f):
+            for char in chars:
+                if isinstance(char, six.string_types) and len(char) == 1:
+                    cls.character_map[ord(char)] = f
+                else:
+                    cls.character_map[char] = f
+            return f
+        return wrap
+
+
 class BasePage(object):
     """
     Base terminal viewer incorperates a cursor to navigate content
@@ -115,21 +166,35 @@ class BasePage(object):
         self._content_window = None
         self._subwindows = None
 
+    @Controller.register(None)
+    def key_not_found(self):
+        curses.flash()
+
+    @Controller.register(curses.KEY_RESIZE)
+    def resize(self):
+        # Do nothing so that the screen can be refreshed
+        pass
+
+    @Controller.register('q')
+    def exit(self):
+        sys.exit()
+
+    @Controller.register('?')
+    def show_help(self):
+        show_help(self.stdscr)
+
+    @Controller.register(curses.KEY_UP, 'k')
     def move_cursor_up(self):
         self._move_cursor(-1)
+        self._clear_input_queue()
 
+    @Controller.register(curses.KEY_DOWN, 'j')
     def move_cursor_down(self):
         self._move_cursor(1)
+        self._clear_input_queue()
 
-    def clear_input_queue(self):
-        "Clear excessive input caused by the scroll wheel or holding down a key"
-        self.stdscr.nodelay(1)
-        while self.stdscr.getch() != -1:
-            continue
-        self.stdscr.nodelay(0)
-
+    @Controller.register('a')
     def upvote(self):
-
         data = self.content.get(self.nav.absolute_index)
         try:
             if 'likes' not in data:
@@ -143,8 +208,8 @@ class BasePage(object):
         except praw.errors.LoginOrScopeRequired:
             show_notification(self.stdscr, ['Login to vote'])
 
+    @Controller.register('z')
     def downvote(self):
-
         data = self.content.get(self.nav.absolute_index)
         try:
             if 'likes' not in data:
@@ -158,8 +223,7 @@ class BasePage(object):
         except praw.errors.LoginOrScopeRequired:
             show_notification(self.stdscr, ['Login to vote'])
 
-    def draw(self):
-
+    def _draw_page(self):
         n_rows, n_cols = self.stdscr.getmaxyx()
         if n_rows < self.MIN_HEIGHT or n_cols < self.MIN_WIDTH:
             return
@@ -173,8 +237,7 @@ class BasePage(object):
         self._draw_content()
         self._add_cursor()
 
-    @staticmethod
-    def draw_item(window, data, inverted):
+    def _draw_item(self, window, data, inverted):
         raise NotImplementedError
 
     def _draw_header(self):
@@ -221,7 +284,7 @@ class BasePage(object):
             start = current_row - window_rows if inverted else current_row
             subwindow = self._content_window.derwin(
                 window_rows, window_cols, start, data['offset'])
-            attr = self.draw_item(subwindow, data, inverted)
+            attr = self._draw_item(subwindow, data, inverted)
             self._subwindows.append((subwindow, attr))
             available_rows -= (window_rows + 1)  # Add one for the blank line
             current_row += step * (window_rows + 1)
@@ -246,15 +309,12 @@ class BasePage(object):
         self._edit_cursor(curses.A_NORMAL)
 
     def _move_cursor(self, direction):
-
         self._remove_cursor()
-
         valid, redraw = self.nav.move(direction, len(self._subwindows))
-        if not valid: curses.flash()
-
+        if not valid:
+            curses.flash()
         # Note: ACS_VLINE doesn't like changing the attribute, so always redraw.
         # if redraw: self._draw_content()
-        self._draw_content()
         self._add_cursor()
 
     def _edit_cursor(self, attribute=None):
@@ -272,3 +332,10 @@ class BasePage(object):
             window.chgat(row, 0, 1, attribute)
 
         window.refresh()
+
+    def _clear_input_queue(self):
+        "Clear excessive input caused by the scroll wheel or holding down a key"
+        self.stdscr.nodelay(1)
+        while self.stdscr.getch() != -1:
+            continue
+        self.stdscr.nodelay(0)

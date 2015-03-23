@@ -5,17 +5,22 @@ import time
 import praw.errors
 
 from .content import SubmissionContent
-from .page import BasePage
+from .page import BasePage, Controller
 from .helpers import clean, open_browser
 from .curses_helpers import (BULLET, UARROW, DARROW, Color, LoadScreen,
-                             show_help, show_notification, text_input)
+                             text_input)
 
-__all__ = ['SubmissionPage']
+__all__ = ['SubmissionController', 'SubmissionPage']
+
+class SubmissionController(Controller):
+    """Controller for submission page."""
+    character_map = {}
 
 class SubmissionPage(BasePage):
 
     def __init__(self, stdscr, reddit, url=None, submission=None):
 
+        self.controller = SubmissionController(self)
         self.loader = LoadScreen(stdscr)
 
         if url is not None:
@@ -30,58 +35,21 @@ class SubmissionPage(BasePage):
 
     def loop(self):
 
-        self.draw()
-
-        while True:
+        self.active = True
+        while self.active:
+            self._draw_page()
             cmd = self.stdscr.getch()
+            self.controller.trigger(cmd)
 
-            if cmd in (curses.KEY_UP, ord('k')):
-                self.move_cursor_up()
-                self.clear_input_queue()
+    @SubmissionController.register('h', curses.KEY_LEFT)
+    def exit_submission(self):
+        """
+        Return to the subreddit page.
+        """
+        self.active = False
 
-            elif cmd in (curses.KEY_DOWN, ord('j')):
-                self.move_cursor_down()
-                self.clear_input_queue()
-
-            elif cmd in (curses.KEY_RIGHT, curses.KEY_ENTER, ord('l')):
-                self.toggle_comment()
-                self.draw()
-
-            elif cmd in (curses.KEY_LEFT, ord('h')):
-                break
-
-            elif cmd == ord('o'):
-                self.open_link()
-                self.draw()
-
-            elif cmd in (curses.KEY_F5, ord('r')):
-                self.refresh_content()
-                self.draw()
-
-            elif cmd == ord('c'):
-                self.add_comment()
-                self.draw()
-                
-            elif cmd == ord('?'):
-                show_help(self.stdscr)
-                self.draw()
-
-            elif cmd == ord('a'):
-                self.upvote()
-                self.draw()
-
-            elif cmd == ord('z'):
-                self.downvote()
-                self.draw()
-
-            elif cmd == ord('q'):
-                sys.exit()
-
-            elif cmd == curses.KEY_RESIZE:
-                self.draw()
-
+    @SubmissionController.register(curses.KEY_RIGHT, curses.KEY_ENTER, 'l')
     def toggle_comment(self):
-        
         current_index = self.nav.absolute_index
         self.content.toggle(current_index)
         if self.nav.inverted:
@@ -90,33 +58,93 @@ class SubmissionPage(BasePage):
             # cursor index to go out of bounds.
             self.nav.page_index, self.nav.cursor_index = current_index, 0
 
+    @SubmissionController.register('r', curses.KEY_F5)
     def refresh_content(self):
-
+        """
+        Reset the content generator to force comments to re-download.
+        """
         url = self.content.name
         self.content = SubmissionContent.from_url(self.reddit, url, self.loader)
         self.nav.page_index, self.nav.cursor_index = -1, 0
         self.nav.inverted = False
 
+    @SubmissionController.register('o')
     def open_link(self):
-
+        """
+        Open the selected link in a webbrowser tab.
+        """
         # Always open the page for the submission
         # May want to expand at some point to open comment permalinks
         url = self.content.get(-1)['permalink']
         open_browser(url)
 
-    def draw_item(self, win, data, inverted=False):
+    @SubmissionController.register('c')
+    def add_comment(self):
+        """
+        Add a comment on the submission if a header is selected.
+        Reply to a comment if the comment is selected.
+        """
+
+        if not self.reddit.is_logged_in():
+            display_message(self.stdscr, ["Login to reply"])
+            return
+
+        data = self.content.get(self.nav.absolute_index)
+        if data['type'] not in ('Comment', 'Submission'):
+            curses.flash()
+            return
+
+        # Fill the bottom half of the screen with the comment box
+        n_rows, n_cols = self.stdscr.getmaxyx()
+        box_height = n_rows // 2
+        attr = curses.A_BOLD | Color.CYAN
+
+        for x in range(n_cols):
+            y = box_height - 1
+            # http://bugs.python.org/issue21088
+            if (sys.version_info.major,
+                sys.version_info.minor,
+                sys.version_info.micro) == (3, 4, 0):
+                x, y = y, x
+
+            self.stdscr.addch(y, x, curses.ACS_HLINE, attr)
+
+        prompt = 'Enter comment: ESC to cancel, Ctrl+g to submit'
+        scol = max(0, (n_cols // 2) - (len(prompt) // 2))
+        self.stdscr.addnstr(box_height-1, scol, prompt, n_cols-scol, attr)
+        self.stdscr.refresh()
+
+        window = self.stdscr.derwin(n_rows-box_height, n_cols, box_height, 0)
+        window.attrset(Color.CYAN)
+
+        comment_text = text_input(window, allow_resize=False)
+        if comment_text is None:
+            return
+
+        try:
+            if data['type'] == 'Submission':
+                data['object'].add_comment(comment_text)
+            else:
+                data['object'].reply(comment_text)
+        except praw.errors.APIException as e:
+            display_message(self.stdscr, [e.message])
+        else:
+            time.sleep(0.5)
+            self.refresh_content()
+
+    def _draw_item(self, win, data, inverted=False):
 
         if data['type'] == 'MoreComments':
-            return self.draw_more_comments(win, data)
+            return self._draw_more_comments(win, data)
         elif data['type'] == 'HiddenComment':
-            return self.draw_more_comments(win, data)
+            return self._draw_more_comments(win, data)
         elif data['type'] == 'Comment':
-            return self.draw_comment(win, data, inverted=inverted)
+            return self._draw_comment(win, data, inverted=inverted)
         else:
-            return self.draw_submission(win, data)
+            return self._draw_submission(win, data)
 
     @staticmethod
-    def draw_comment(win, data, inverted=False):
+    def _draw_comment(win, data, inverted=False):
 
         n_rows, n_cols = win.getmaxyx()
         n_cols -= 1
@@ -171,7 +199,7 @@ class SubmissionPage(BasePage):
         return (attr | curses.ACS_VLINE)
 
     @staticmethod
-    def draw_more_comments(win, data):
+    def _draw_more_comments(win, data):
 
         n_rows, n_cols = win.getmaxyx()
         n_cols -= 1
@@ -189,7 +217,7 @@ class SubmissionPage(BasePage):
         return (attr | curses.ACS_VLINE)
 
     @staticmethod
-    def draw_submission(win, data):
+    def _draw_submission(win, data):
 
         n_rows, n_cols = win.getmaxyx()
         n_cols -= 3 # one for each side of the border + one for offset
@@ -228,56 +256,3 @@ class SubmissionPage(BasePage):
         win.addnstr(row, 1, text, n_cols, curses.A_BOLD)
 
         win.border()
-
-    def add_comment(self):
-        """
-        Add a comment on the submission if a header is selected.
-        Reply to a comment if the comment is selected.
-        """
-
-        if not self.reddit.is_logged_in():
-            show_notification(self.stdscr, ["Login to reply"])
-            return
-
-        data = self.content.get(self.nav.absolute_index)
-        if data['type'] not in ('Comment', 'Submission'):
-            curses.flash()
-            return
-
-        # Fill the bottom half of the screen with the comment box
-        n_rows, n_cols = self.stdscr.getmaxyx()
-        box_height = n_rows // 2
-        attr = curses.A_BOLD | Color.CYAN
-
-        for x in range(n_cols):
-            y = box_height - 1
-            # http://bugs.python.org/issue21088
-            if (sys.version_info.major,
-                sys.version_info.minor,
-                sys.version_info.micro) == (3, 4, 0):
-                x, y = y, x
-
-            self.stdscr.addch(y, x, curses.ACS_HLINE, attr)
-
-        prompt = 'Enter comment: ESC to cancel, Ctrl+g to submit'
-        scol = max(0, (n_cols // 2) - (len(prompt) // 2))
-        self.stdscr.addnstr(box_height-1, scol, prompt, n_cols-scol, attr)
-        self.stdscr.refresh()
-
-        window = self.stdscr.derwin(n_rows-box_height, n_cols, box_height, 0)
-        window.attrset(Color.CYAN)
-
-        comment_text = text_input(window, allow_resize=False)
-        if comment_text is None:
-            return
-        
-        try:
-            if data['type'] == 'Submission':
-                data['object'].add_comment(comment_text)
-            else:
-                data['object'].reply(comment_text)
-        except praw.errors.APIException as e:
-            show_notification(self.stdscr, [e.message])
-        else:
-            time.sleep(0.5)
-            self.refresh_content()

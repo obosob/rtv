@@ -4,22 +4,27 @@ import sys
 import requests
 
 from .exceptions import SubredditError
-from .page import BasePage
+from .page import BasePage, Controller
 from .submission import SubmissionPage
 from .content import SubredditContent
 from .helpers import clean, open_browser
-from .curses_helpers import (BULLET, UARROW, DARROW, Color, LoadScreen, 
-                             text_input, show_notification, show_help)
+from .curses_helpers import (BULLET, UARROW, DARROW, Color, LoadScreen,
+                             text_input, show_notification)
 
-__all__ = ['opened_links', 'SubredditPage']
+__all__ = ['opened_links', 'SubredditController', 'SubredditPage']
 
 # Used to keep track of browsing history across the current session
 opened_links = set()
+
+class SubredditController(Controller):
+    """Controller for subreddit page."""
+    character_map = {}
 
 class SubredditPage(BasePage):
 
     def __init__(self, stdscr, reddit, name):
 
+        self.controller = SubredditController(self)
         self.loader = LoadScreen(stdscr)
 
         content = SubredditContent.from_name(reddit, name, self.loader)
@@ -27,74 +32,33 @@ class SubredditPage(BasePage):
 
     def loop(self):
 
-        self.draw()
-
         while True:
+            self._draw_page()
             cmd = self.stdscr.getch()
+            self.controller.trigger(cmd)
 
-            if cmd in (curses.KEY_UP, ord('k')):
-                self.move_cursor_up()
-                self.clear_input_queue()
-
-            elif cmd in (curses.KEY_DOWN, ord('j')):
-                self.move_cursor_down()
-                self.clear_input_queue()
-
-            elif cmd in (curses.KEY_RIGHT, curses.KEY_ENTER, ord('l')):
-                self.open_submission()
-                self.draw()
-
-            elif cmd == ord('o'):
-                self.open_link()
-                self.draw()
-
-            elif cmd in (curses.KEY_F5, ord('r')):
-                self.refresh_content()
-                self.draw()
-
-            elif cmd == ord('?'):
-                show_help(self.stdscr)
-                self.draw()
-
-            elif cmd == ord('a'):
-                self.upvote()
-                self.draw()
-
-            elif cmd == ord('z'):
-                self.downvote()
-                self.draw()
-
-            elif cmd == ord('q'):
-                sys.exit()
-
-            elif cmd == curses.KEY_RESIZE:
-                self.draw()
-
-            elif cmd == ord('/'):
-                self.prompt_subreddit()
-                self.draw()
-
+    @SubredditController.register('r', curses.KEY_F5)
     def refresh_content(self, name=None):
-
+        """
+        Reset the content generator to force the subreddit to re-download.
+        """
         name = name or self.content.name
-
         try:
             self.content = SubredditContent.from_name(
                 self.reddit, name, self.loader)
-
         except SubredditError:
             show_notification(self.stdscr, ['Invalid subreddit'])
-
         except requests.HTTPError:
             show_notification(self.stdscr, ['Could not reach subreddit'])
-
         else:
             self.nav.page_index, self.nav.cursor_index = 0, 0
             self.nav.inverted = False
 
+    @SubredditController.register('/')
     def prompt_subreddit(self):
-        "Open a prompt to type in a new subreddit"
-
+        """
+        Open a prompt to type in a new subreddit.
+        """
         attr = curses.A_BOLD | Color.CYAN
         prompt = 'Enter Subreddit: /r/'
         n_rows, n_cols = self.stdscr.getmaxyx()
@@ -107,28 +71,32 @@ class SubredditPage(BasePage):
         if out is not None:
             self.refresh_content(name=out)
 
+    @SubredditController.register(curses.KEY_RIGHT, curses.KEY_ENTER, 'l')
     def open_submission(self):
-        "Select the current submission to view posts"
+        """
+        Select the current submission to view posts.
+        """
+        global opened_links
 
         data = self.content.get(self.nav.absolute_index)
         page = SubmissionPage(self.stdscr, self.reddit, url=data['permalink'])
         page.loop()
-
         if data['url'] == 'selfpost':
-            global opened_links
             opened_links.add(data['url_full'])
 
+    @SubredditController.register('o')
     def open_link(self):
-        "Open a link with the webbrowser"
+        """
+        Open the selected link in a webbrowser tab.
+        """
+        global opened_links
 
         url = self.content.get(self.nav.absolute_index)['url_full']
         open_browser(url)
-
-        global opened_links
         opened_links.add(url)
 
     @staticmethod
-    def draw_item(win, data, inverted=False):
+    def _draw_item(win, data, inverted=False):
 
         n_rows, n_cols = win.getmaxyx()
         n_cols -= 1  # Leave space for the cursor in the first column
